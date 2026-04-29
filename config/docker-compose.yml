@@ -1,0 +1,55 @@
+version: '3.8'
+services:
+  # 1. Nacos (使用内嵌数据库，不需要连 MySQL)
+  nacos:
+    image: nacos/nacos-server:v2.4.3
+    container_name: nacos
+    environment:
+      - MODE=standalone
+      - JVM_XMS=256m
+      - JVM_XMX=256m
+    ports:
+      - "8848:8848"
+      - "9848:9848"
+    restart: always
+
+  # 2. Seata (使用 File 模式，不需要连 MySQL)
+  seata:
+    image: seataio/seata-server:1.7.1
+    container_name: seata-server
+    ports:
+      - "8091:8091"
+      - "7091:7091"
+    environment:
+      - SEATA_IP=127.0.0.1
+      - STORE_MODE=file
+    restart: always
+
+  # 3. Redis (直播/点评项目核心)
+  redis:
+    image: redis:7
+    container_name: interview-redi
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # 4. RocketMQ NameServer
+  namesrv:
+    image: apache/rocketmq:5.3.1
+    container_name: rmqnamesrv
+    ports:
+      - "9876:9876"
+    command: sh mqnamesrv
+
+  # 5. RocketMQ Broker
+  broker:
+    image: apache/rocketmq:5.3.1
+    container_name: rmqbroker
+    ports:
+      - "10911:10911"
+      - "10909:10909"
+    depends_on:
+      - namesrv
+    environment:
+      - NAMESRV_ADDR=namesrv:9876
+    command: sh -c "echo 'brokerIP1 = host.docker.internal' > /home/rocketmq/rocketmq-5.3.1/conf/broker.conf && sh mqbroker -n namesrv:9876 -c /home/rocketmq/rocketmq-5.3.1/conf/broker.conf"
