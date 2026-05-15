@@ -41,7 +41,8 @@ public class VoucherController {
      */
     @PostMapping("seckill")
     public Result addSeckillVoucher(@RequestBody Voucher voucher) {
-        voucherService.addSeckillVoucher(voucher);
+//        voucherService.addSeckillVoucher(voucher);
+        voucherService.addVoucher(voucher);
         return Result.ok(voucher.getId());
     }
 
@@ -65,6 +66,10 @@ public class VoucherController {
         return voucherService.deductStock(voucherId);
     }
 
+    @PutMapping("voucher/reduce/{id}/stock")
+    public Result deductNormalVoucherStock(@PathVariable("id") Long voucherId)  {
+        return voucherService.deductNormalVoucherStock(voucherId);
+    };
 
     /**
      * 预热/刷新所有秒杀券库存到 Redis

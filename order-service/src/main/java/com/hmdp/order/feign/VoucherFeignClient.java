@@ -15,4 +15,7 @@ public interface VoucherFeignClient {
 
     @GetMapping("voucher/{id}")
     Result getVoucherById(@PathVariable("id") Long voucherId);
+
+    @PutMapping("voucher/reduce/{id}/stock")
+    Result deductNormalVoucherStock(@PathVariable("id") Long voucherId);
 }

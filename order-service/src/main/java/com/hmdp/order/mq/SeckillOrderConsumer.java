@@ -108,7 +108,7 @@ public class SeckillOrderConsumer implements RocketMQListener<SeckillOrderMessag
                 );
                 if (count > 0) {
                     log.warn("用户已购买过该优惠券，一人一单校验失败: userId={}, voucherId={}", userId, voucherId);
-                    rollbackRedisData(voucherId, userId);
+                    rollbackRedisStockOnly(voucherId, userId);
                     seckillMetrics.incrementMqConsumeFail();
                     return;
                 }
@@ -182,4 +182,18 @@ public class SeckillOrderConsumer implements RocketMQListener<SeckillOrderMessag
             log.error("Redis数据回滚失败: voucherId={}, userId={}, error={}", voucherId, userId, e.getMessage(), e);
         }
     }
+
+    private void rollbackRedisStockOnly(Long voucherId, Long userId) {
+        try {
+            stringRedisTemplate.opsForValue()
+                    .increment(RedisConstants.SECKILL_STOCK_KEY + voucherId);
+
+            log.info("重复下单仅回滚Redis库存，保留用户购买标记: voucherId={}, userId={}",
+                    voucherId, userId);
+        } catch (Exception e) {
+            log.error("Redis库存回滚失败: voucherId={}, userId={}, error={}",
+                    voucherId, userId, e.getMessage(), e);
+        }
+    }
+
 }

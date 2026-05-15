@@ -16,6 +16,8 @@ import com.hmdp.shop.mapper.ShopMapper;
 import com.hmdp.shop.service.IShopService;
 import com.hmdp.utils.MqConstants;
 import com.hmdp.utils.SystemConstants;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import com.github.benmanes.caffeine.cache.Cache; // 优先 import Caffeine 的 Cache
@@ -45,6 +47,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.SHOP_GEO_KEY;
@@ -89,49 +92,52 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Resource
     private RedisTemplate<String, Object> redisTemplate;
 
+    @Resource
+    private RedissonClient redissonClient;
+
     // NOTE 线程池用于异步缓存预热
     private ExecutorService cacheWarmupExecutor;
 
-    /**
-     * 初始化方法 - 创建线程池
-     */
-    @PostConstruct
-    public void init() {
-        // 创建固定大小的线程池用于缓存预热
-        cacheWarmupExecutor = Executors.newFixedThreadPool(3);
-        logger.info("缓存预热线程池初始化完成");
-    }
-
-    /**
-     * 缓存预热 - 应用启动时执行
-     */
-    //NOTE 使用 @PostConstruct 注解确保该方法在服务启动后立即执行 自动预热
-    // NOTE 使用 @Async 注解使该方法异步执行，避免阻塞应用启动过程
-    @PostConstruct
-    @Async
-    public void warmUpCacheOnStartup() {
-        try {
-            // 延迟启动，等待应用完全启动
-            Thread.sleep(10000);
-            logger.info("开始执行应用启动缓存预热...");
-
-            // 预热热门店铺数据
-            warmUpPopularShops();
-
-            // 预热按类型分类的店铺
-            warmUpShopsByType();
-
-            // 预热地理位置数据
-            warmUpGeoData();
-
-            logger.info("应用启动缓存预热完成");
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            logger.error("缓存预热被中断", e);
-        } catch (Exception e) {
-            logger.error("缓存预热执行失败", e);
-        }
-    }
+//    /**
+//     * 初始化方法 - 创建线程池
+//     */
+//    @PostConstruct
+//    public void init() {
+//        // 创建固定大小的线程池用于缓存预热
+//        cacheWarmupExecutor = Executors.newFixedThreadPool(3);
+//        logger.info("缓存预热线程池初始化完成");
+//    }
+//
+//    /**
+//     * 缓存预热 - 应用启动时执行
+//     */
+//    //NOTE 使用 @PostConstruct 注解确保该方法在服务启动后立即执行 自动预热
+//    // NOTE 使用 @Async 注解使该方法异步执行，避免阻塞应用启动过程
+//    @PostConstruct
+//    @Async
+//    public void warmUpCacheOnStartup() {
+//        try {
+//            // 延迟启动，等待应用完全启动
+//            Thread.sleep(10000);
+//            logger.info("开始执行应用启动缓存预热...");
+//
+//            // 预热热门店铺数据
+//            warmUpPopularShops();
+//
+//            // 预热按类型分类的店铺
+//            warmUpShopsByType();
+//
+//            // 预热地理位置数据
+//            warmUpGeoData();
+//
+//            logger.info("应用启动缓存预热完成");
+//        } catch (InterruptedException e) {
+//            Thread.currentThread().interrupt();
+//            logger.error("缓存预热被中断", e);
+//        } catch (Exception e) {
+//            logger.error("缓存预热执行失败", e);
+//        }
+//    }
 
     /**
      * 预热热门店铺数据
@@ -402,7 +408,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         String key = "shop:cache:" + id;
         String shopJson = stringRedisTemplate.opsForValue().get(key);
 
-        if (StrUtil.isNotBlank(shopJson)) {
+        if (shopJson != null) {
+            if (StrUtil.isBlank(shopJson)) {
+                return Result.fail("店铺不存在!");
+            }
             shop = JSONUtil.toBean(shopJson, Shop.class);
             // 记得回写 L1，方便下次直接命中
             shopCache.put(id, shop);
@@ -410,22 +419,46 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             return Result.ok(shop);
         }
 
-        // 3. 缓存都不中，尝试获取分布式锁（解决缓存击穿）
-        // ... 这里可以写 Redisson 锁逻辑 ...
+        String lockKey = "lock:shop:" + id;
+        RLock lock = redissonClient.getLock(lockKey);
 
-        // 4. 查询数据库
-        shop = getById(id);
-        if (shop == null) {
-            // 解决缓存穿透：Redis 存入空值
-            stringRedisTemplate.opsForValue().set(key, "", 2, TimeUnit.MINUTES);
-            return Result.fail("店铺不存在!");
+        try {
+            boolean locked = lock.tryLock(3, TimeUnit.SECONDS);
+            if (!locked) {
+                Thread.sleep(50);
+                return queryById(id);
+            }
+
+            // 双重检查，防止多个线程排队拿锁后重复查库
+            shopJson = stringRedisTemplate.opsForValue().get(key);
+            if (shopJson != null) {
+                if (StrUtil.isBlank(shopJson)) {
+                    return Result.fail("店铺不存在!");
+                }
+                shop = JSONUtil.toBean(shopJson, Shop.class);
+                shopCache.put(id, shop);
+                return Result.ok(shop);
+            }
+
+            shop = getById(id);
+            if (shop == null) {
+                stringRedisTemplate.opsForValue().set(key, "", 2, TimeUnit.MINUTES);
+                return Result.fail("店铺不存在!");
+            }
+
+            int ttl = 30 + ThreadLocalRandom.current().nextInt(1, 6);
+            stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), ttl, TimeUnit.MINUTES);
+            shopCache.put(id, shop);
+
+            return Result.ok(shop);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Result.fail("查询失败");
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
-
-        // 5. 写入各级缓存
-        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), 30, TimeUnit.MINUTES);
-        shopCache.put(id, shop);
-
-        return Result.ok(shop);
     }
 
     //NOTE 这个方法使用了Spring Cache的@CacheEvict注解来实现缓存更新功能
@@ -441,6 +474,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
         // 1. 更新数据库
         updateById(shop);
+
+        String key = "shop:cache:" + shop.getId();
+        stringRedisTemplate.delete(key);
 
         // 3. 发送广播消息，通知所有实例清理一级缓存 (Caffeine)
         // 发送内容只需是 ID 即可
@@ -471,7 +507,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Override
     public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
-        logger.info("查询类型为 {} 的店铺，页码: {}, 坐标: ({}, {})");
+        logger.info("查询类型为 {} 的店铺，页码: {}, 坐标: ({}, {})",typeId,current, x, y);
 
         // 1.判断是否需要根据坐标查询
         if (x == null || y == null) {
