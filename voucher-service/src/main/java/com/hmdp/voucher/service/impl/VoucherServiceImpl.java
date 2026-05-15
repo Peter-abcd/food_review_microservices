@@ -43,22 +43,29 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         return Result.ok(vouchers);
     }
 
+    @Transactional(rollbackFor = Exception.class)
     @Override
-    @Transactional
-    public void addSeckillVoucher(Voucher voucher) {
-        // 保存优惠券
+    public void addVoucher(Voucher voucher) {
+        // 1. 保存优惠券基础信息
         save(voucher);
-        // 保存秒杀信息
-        SeckillVoucher seckillVoucher = new SeckillVoucher();
-        seckillVoucher.setVoucherId(voucher.getId());
-        seckillVoucher.setStock(voucher.getStock());
-        seckillVoucher.setBeginTime(voucher.getBeginTime());
-        seckillVoucher.setEndTime(voucher.getEndTime());
-        seckillVoucherService.save(seckillVoucher);
-        //保存秒杀库存到redis中
-        stringRedisTemplate.opsForValue().set(SECKILL_STOCK_KEY + voucher.getId(),voucher.getStock().toString());
 
+        // 2. 如果是秒杀券，保存秒杀扩展信息，并初始化 Redis 库存
+        if (voucher.getType() != null && voucher.getType() == 1) {
+            SeckillVoucher seckillVoucher = new SeckillVoucher();
+            seckillVoucher.setVoucherId(voucher.getId());
+            seckillVoucher.setStock(voucher.getStock());
+            seckillVoucher.setBeginTime(voucher.getBeginTime());
+            seckillVoucher.setEndTime(voucher.getEndTime());
+
+            seckillVoucherService.save(seckillVoucher);
+
+            stringRedisTemplate.opsForValue().set(
+                    SECKILL_STOCK_KEY + voucher.getId(),
+                    voucher.getStock().toString()
+            );
+        }
     }
+
 
     @Override
     public Result deductStock(Long voucherId) {
@@ -73,7 +80,7 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
             return Result.fail("库存不足");
         }
         // 更新Redis中的库存
-        stringRedisTemplate.opsForValue().decrement(SECKILL_STOCK_KEY + voucherId);
+//        stringRedisTemplate.opsForValue().decrement(SECKILL_STOCK_KEY + voucherId);
         return Result.ok();
     }
 
@@ -97,4 +104,21 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
 //            log.info("预热秒杀券库存成功：voucherId={}, stock={}", seckillVoucher.getVoucherId(), seckillVoucher.getStock());
         }
     }
+
+    @Override
+    public Result deductNormalVoucherStock(Long voucherId) {
+        boolean success = update()
+                .setSql("stock = stock - 1")
+                .eq("id", voucherId)
+                .eq("type", 0)
+                .gt("stock", 0)
+                .update();
+
+        if (!success) {
+            return Result.fail("库存不足");
+        }
+
+        return Result.ok();
+    }
+
 }

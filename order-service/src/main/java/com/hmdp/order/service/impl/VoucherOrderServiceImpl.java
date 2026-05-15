@@ -149,4 +149,41 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
         save(voucherOrder);
     }
+
+    @Override
+    @GlobalTransactional(name = "order-normal-voucher", rollbackFor = Exception.class)
+    @Transactional(rollbackFor = Exception.class)
+    public Result orderVoucher(Long voucherId) {
+        Long userId = UserHolder.getUser().getId();
+
+        Long count = query()
+                .eq("user_id", userId)
+                .eq("voucher_id", voucherId)
+                .count();
+
+        if (count > 0) {
+            return Result.fail("用户已经领取过该优惠券");
+        }
+
+        // 调用优惠券服务扣减普通券库存
+        Result deductResult = voucherFeignClient.deductNormalVoucherStock(voucherId);
+
+        if (!deductResult.getSuccess()) {
+            throw new RuntimeException("普通券库存扣减失败：" + deductResult.getErrorMsg());
+        }
+
+        VoucherOrder voucherOrder = new VoucherOrder();
+        voucherOrder.setId(redisIdWorker.nextId("order"));
+        voucherOrder.setUserId(userId);
+        voucherOrder.setVoucherId(voucherId);
+        voucherOrder.setStatus(1);
+
+        boolean saved = save(voucherOrder);
+        if (!saved) {
+            throw new RuntimeException("优惠券订单创建失败");
+        }
+
+        return Result.ok(voucherOrder.getId());
+    }
+
 }
