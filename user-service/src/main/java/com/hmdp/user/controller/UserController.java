@@ -17,6 +17,8 @@ import org.springframework.web.bind.annotation.*;
 import jakarta.annotation.Resource;
 import jakarta.servlet.http.HttpSession;
 
+import java.util.List;
+
 /**
  * <p>
  * 前端控制器
@@ -99,6 +101,20 @@ public class UserController {
         UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
         // 返回
         return Result.ok(userDTO);
+    }
+
+    /**
+     * 根据 id 集合批量查询用户。
+     *
+     * 给 social-service 通过 Feign 调用（Feed 流的点赞用户列表 / 关注列表的批量作者信息）。
+     * 【为什么是 POST 不是 GET】批量 id 放在请求体里。原来的 Feign 声明是
+     * `@GetMapping("/user/list") + @RequestBody` —— GET 带 body 本身就是反模式，
+     * 很多网关/代理会直接丢掉 GET 的 body；而且 user-service 里根本没有 /user/list 这个 handler，
+     * 请求会撞到 /user/{id} 上，把 "list" 当 Long 解析而失败。
+     */
+    @PostMapping("/list")
+    public Result queryUserByIds(@RequestBody List<Long> ids) {
+        return userService.queryUserByIds(ids);
     }
 
     @PostMapping("/sign")

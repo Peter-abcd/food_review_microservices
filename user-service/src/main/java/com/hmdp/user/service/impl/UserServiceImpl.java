@@ -23,8 +23,10 @@ import jakarta.servlet.http.HttpSession;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static com.hmdp.utils.RedisConstants.*;
 import static com.hmdp.utils.SystemConstants.USER_NICK_NAME_PREFIX;
@@ -136,6 +138,20 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         org.springframework.beans.BeanUtils.copyProperties(user, userDTO);
         return userDTO;
     }
+    @Override
+    public Result queryUserByIds(List<Long> ids) {
+        // social-service 的 Feed 流点赞列表 / 关注列表靠这个批量拿作者信息（Feign 调用）。
+        // 返回 List<UserDTO> 而不是 List<User>：调用方直接按 UserDTO 用，
+        // 且不能把 password 等字段透出去。
+        if (ids == null || ids.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        List<UserDTO> userDTOS = listByIds(ids).stream()
+                .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+                .collect(Collectors.toList());
+        return Result.ok(userDTOS);
+    }
+
     @Override
     public Result sign() {
         // 1.获取当前登录用户

@@ -24,7 +24,13 @@ public interface UserFeignClient {
 
     /**
      * 根据用户id列表查询用户信息
+     *
+     * 【必须是 POST】批量 id 放在请求体里。原先是 @GetMapping + @RequestBody：
+     *   ① GET 带 body 是反模式，网关/代理可能直接丢掉 body；
+     *   ② user-service 里原本没有 /user/list 这个 handler，请求会落到 /user/{id} 上，
+     *      把 "list" 当 Long 解析而失败。
+     * 配套：user-service 的 UserController#queryUserByIds 新增了 @PostMapping("/list")。
      */
-    @GetMapping("/user/list")
+    @PostMapping("/user/list")
     Result getUserByIds(@RequestBody List<Long> ids);
 }

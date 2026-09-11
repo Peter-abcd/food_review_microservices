@@ -7,6 +7,8 @@ import com.hmdp.entity.User;
 
 import jakarta.servlet.http.HttpSession;
 
+import java.util.List;
+
 /**
  * <p>
  *  服务类
@@ -20,6 +22,11 @@ public interface IUserService extends IService<User> {
     Result sendCode(String phone, HttpSession session);
 
     Result login(LoginFormDTO loginForm, HttpSession session);
+
+    /**
+     * 根据 id 集合批量查询用户（返回 List&lt;UserDTO&gt;，供 social-service 的 Feign 调用）
+     */
+    Result queryUserByIds(List<Long> ids);
 
     Result sign();
 
