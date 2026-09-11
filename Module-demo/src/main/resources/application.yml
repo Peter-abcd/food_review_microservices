@@ -1,4 +1,6 @@
-rocketmq:
-  name-server: 127.0.0.1:9876
-  producer:
-    group: test-producer-group
+spring:
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest

@@ -17,16 +17,17 @@ public class RedissonConfig {
 
     /**
      * Redis主机地址，从Spring配置中读取，默认值为localhost
-     * 使用统一的spring.redis配置路径
+     * 注意：Spring Boot 3 的配置前缀是 spring.data.redis.*，
+     * 旧写法 spring.redis.* 在 Boot 3 下不存在，会静默落到默认值 localhost，
+     * 一旦 Redis 不在本机就会连不上。
      */
-    @Value("${spring.redis.host:localhost}")
+    @Value("${spring.data.redis.host:localhost}")
     private String redisHost;
-    
+
     /**
      * Redis端口号，从Spring配置中读取，默认值为6379
-     * 使用统一的spring.redis配置路径
      */
-    @Value("${spring.redis.port:6379}")
+    @Value("${spring.data.redis.port:6379}")
     private int redisPort;
 
     /**

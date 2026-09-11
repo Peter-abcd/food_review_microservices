@@ -88,6 +88,26 @@
             <version>4.1.2</version>
         </dependency>
 
+        <!-- Seata。
+             本服务是全局事务的 RM（分支事务提供方）：不加这个依赖，
+             application.yaml 里的 seata.* 配置无人读取，DataSource 也不会被 AT 代理，
+             于是 Feign 触发的扣库存会跑在自己的本地事务里、完全脱离全局事务 ——
+             上游回滚时这一刀留痕，正是"订单没建、库存却扣了"的来源。
+             判据：启动日志里必须出现
+               Global Transaction Clients are initialized
+               Auto proxy data source 'dataSource' by 'AT' mode -->
+        <dependency>
+            <groupId>io.seata</groupId>
+            <artifactId>seata-spring-boot-starter</artifactId>
+            <exclusions>
+                <!-- 排除有问题的Druid 1.2.6版本 -->
+                <exclusion>
+                    <groupId>com.alibaba</groupId>
+                    <artifactId>druid</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
     </dependencies>
 
     <build>

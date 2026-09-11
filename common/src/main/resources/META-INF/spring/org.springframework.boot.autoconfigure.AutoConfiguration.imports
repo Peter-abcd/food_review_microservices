@@ -1,1 +1,2 @@
 com.hmdp.config.WebMvcConfig
+com.hmdp.config.RedissonConfig

@@ -25,31 +25,19 @@ services:
       - STORE_MODE=file
     restart: always
 
-  # 3. Redis (直播/点评项目核心)
+  # 3. Redis
   redis:
     image: redis:7
-    container_name: interview-redi
+    container_name: redis
     ports:
       - "6379:6379"
     restart: always
 
-  # 4. RocketMQ NameServer
-  namesrv:
-    image: apache/rocketmq:5.3.1
-    container_name: rmqnamesrv
+  # 4. RabbitMQ
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
     ports:
-      - "9876:9876"
-    command: sh mqnamesrv
-
-  # 5. RocketMQ Broker
-  broker:
-    image: apache/rocketmq:5.3.1
-    container_name: rmqbroker
-    ports:
-      - "10911:10911"
-      - "10909:10909"
-    depends_on:
-      - namesrv
-    environment:
-      - NAMESRV_ADDR=namesrv:9876
-    command: sh -c "echo 'brokerIP1 = host.docker.internal' > /home/rocketmq/rocketmq-5.3.1/conf/broker.conf && sh mqbroker -n namesrv:9876 -c /home/rocketmq/rocketmq-5.3.1/conf/broker.conf"
+      - "5672:5672"
+      - "15672:15672"
+    restart: always

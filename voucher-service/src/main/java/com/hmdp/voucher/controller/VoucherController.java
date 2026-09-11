@@ -66,7 +66,7 @@ public class VoucherController {
         return voucherService.deductStock(voucherId);
     }
 
-    @PutMapping("voucher/reduce/{id}/stock")
+    @PutMapping("/reduce/{id}/stock")
     public Result deductNormalVoucherStock(@PathVariable("id") Long voucherId)  {
         return voucherService.deductNormalVoucherStock(voucherId);
     };

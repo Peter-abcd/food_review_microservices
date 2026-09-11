@@ -21,11 +21,6 @@ spring:
   config:
     import: optional:nacos:${spring.application.name}.yaml # 从 Nacos 导入配置，optional 表示可选，导入失败不影响启动
 
-rocketmq:
-  name-server: 127.0.0.1:9876
-  producer:
-    group: seckill-producer-group
-
 # Seata 分布式事务配置
 seata:
   tx-service-group: hmdp-group # 事务服务组名称，用于标识不同的事务分组

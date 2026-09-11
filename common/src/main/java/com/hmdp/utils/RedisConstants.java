@@ -15,6 +15,16 @@ public class RedisConstants {
     public static final Long LOCK_SHOP_TTL = 10L;
 
     public static final String SECKILL_STOCK_KEY = "seckill:stock:";
+
+    /** 已下单用户集合，key = seckill:order:{voucherId}，由 seckill.lua 写入 */
+    public static final String SECKILL_ORDER_KEY = "seckill:order:";
+
+    /** 订单明细哈希，key = seckill:order:detail:{voucherId}，由 seckill.lua 写入（field = orderId） */
+    public static final String SECKILL_ORDER_DETAIL_KEY = "seckill:order:detail:";
+
+    /** 秒杀订单重试计数，key = seckill:retry:{orderId} */
+    public static final String SECKILL_RETRY_COUNT_KEY = "seckill:retry:";
+
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";

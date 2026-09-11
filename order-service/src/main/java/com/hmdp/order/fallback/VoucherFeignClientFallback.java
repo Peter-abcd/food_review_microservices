@@ -20,4 +20,16 @@ public class VoucherFeignClientFallback implements VoucherFeignClient {
         log.warn("voucher-service服务不可用，查询优惠券降级处理: voucherId={}", voucherId);
         return Result.fail("优惠券服务暂时不可用");
     }
+
+    /**
+     * 普通券库存扣减降级。
+     *
+     * 必须返回失败：若降级返回成功，调用方会继续创建订单，
+     * 结果就是"库存没扣、订单却建了"，账不平。返回失败让调用方中断并回滚。
+     */
+    @Override
+    public Result deductNormalVoucherStock(Long voucherId) {
+        log.warn("voucher-service服务不可用，普通券库存扣减降级处理: voucherId={}", voucherId);
+        return Result.fail("库存服务暂时不可用，普通券下单已中止");
+    }
 }

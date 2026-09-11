@@ -7,14 +7,14 @@ spring:
   # 数据库配置
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver # 数据库驱动类名，MySQL 8.x 使用 com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://127.0.0.1:3306/hm_dianping?useSSL=false&serverTimezone=UTC # 数据库连接URL，格式：jdbc:mysql://ip:port/数据库名?参数
+    url: jdbc:mysql://127.0.0.1:3306/hm_order?useSSL=false&serverTimezone=UTC # 数据库连接URL，格式：jdbc:mysql://ip:port/数据库名?参数
     username: root # 数据库用户名
     password: 1234 # 数据库密码
   # Redis 配置（统一使用 spring.redis 路径）
   data:
     redis:
      host: localhost  # Redis 主机地址，统一为本地地址
-     port: 6379 # Redis 端口，默认 6379
+     port: 6379 # Redis 端口，默认6379
      password: # Redis 密码
     # Redis 连接池配置（使用 Lettuce 客户端）
      lettuce:
@@ -38,16 +38,8 @@ spring:
       mandatory: true
     listener:
       simple:
-        acknowledge-mode: manual        # 【核心】开启消费者手动 ACK！
+        acknowledge-mode: manual        # 【核心】开启消费者手动ACK）
         prefetch: 1                     # 每次只取 1 条消息（防止内存被撑爆，公平分发）
-
-# RocketMQ 配置
-rocketmq:
-  name-server: 127.0.0.1:9876
-  producer:
-    group: seckill-producer-group
-    send-message-timeout: 3000
-    retry-times-when-send-failed: 2
 
 # MyBatis Plus 配置
 mybatis-plus:

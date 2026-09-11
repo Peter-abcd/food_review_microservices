@@ -1,149 +1,134 @@
 package com.hmdp.order.mq;
 
 import com.hmdp.dto.SeckillOrderMessage;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+import com.hmdp.utils.MqConstants;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.rocketmq.spring.core.RocketMQTemplate;
-import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.Resource;
 
 /**
  * 秒杀订单消息生产者
- * 
- * 负责将秒杀资格校验通过的订单发送到消息队列，实现异步下单流程。
- * 核心作用：
- * 1. 流量削峰：将瞬时高并发请求转化为异步消息处理
- * 2. 解耦：分离秒杀资格校验和订单创建两个关键步骤
- * 3. 可靠性：提供同步发送和异步发送两种模式，支持重试机制
- * 
- * 消息主题：
- * - seckill-order-topic: 正常秒杀订单处理
- * - seckill-order-dlq-topic: 死信队列，处理失败消息
- * - stock-sync-topic: 库存同步主题（用于一致性保证）
+ *
+ * 职责：
+ *   1. 流量削峰 —— 把瞬时并发请求转成异步消息
+ *   2. 解耦     —— 资格校验（Redis+Lua）与订单落库分开
+ *   3. 可靠性   —— 通过 broker confirm / return 回调感知投递失败，并补偿 Redis 预扣数据
  */
 @Component
 @Slf4j
 public class SeckillOrderProducer {
 
-    public static final String TOPIC_SECKILL_ORDER = "seckill-order-topic";
-
-    public static final String TOPIC_SECKILL_ORDER_DLQ = "seckill-order-dlq-topic";
-
-    public static final String TOPIC_STOCK_SYNC = "stock-sync-topic";
+    @Resource
+    private RabbitTemplate rabbitTemplate;
 
     @Resource
-    private RocketMQTemplate rocketMQTemplate;
+    private SeckillRedisCompensator compensator;
 
     /**
-     * 同步发送秒杀订单消息
-     * 
-     * 适用于需要立即确认发送结果的场景，保证消息可靠性。
-     * 如果发送失败，会立即返回false，调用方可以相应处理。
-     * 
+     * 发送秒杀订单消息。
+     *
+     * 【重要】返回值含义：只代表"消息已提交给 RabbitTemplate"，不代表 broker 已确认。
+     * 真正的投递结果通过 CorrelationData.getFuture() 异步回调获得（见 attachConfirmCallback）。
+     * 异步链路里不存在"同步返回 true 就等价于投递成功"—— 这正是必须靠 confirm 回调的原因。
+     *
      * @param message 秒杀订单消息
-     * @return true-发送成功，false-发送失败
+     * @return true-已提交（不代表投递成功），false-提交阶段就抛异常了（已做补偿）
      */
     public boolean sendSeckillOrderMessage(SeckillOrderMessage message) {
+        return doSend(message, "同步");
+    }
+
+    /**
+     * 异步发送秒杀订单消息（秒杀主流程使用，不阻塞 Tomcat 线程）。
+     */
+    public boolean sendSeckillOrderMessageAsync(SeckillOrderMessage message) {
+        return doSend(message, "异步");
+    }
+
+    private boolean doSend(SeckillOrderMessage message, String mode) {
+        Long orderId = message.getOrderId();
         try {
-            rocketMQTemplate.syncSend(
-                    TOPIC_SECKILL_ORDER,
-                    MessageBuilder.withPayload(message).build(),
-                    3000
+            // 关键：correlationId 直接放 orderId，
+            // 这样 confirm 回调里仅凭 id 就能定位到具体订单，不需要额外的映射表。
+            CorrelationData correlationData = new CorrelationData(String.valueOf(orderId));
+
+            attachConfirmCallback(correlationData, message);
+
+            rabbitTemplate.convertAndSend(
+                    MqConstants.SECKILL_ORDER_EXCHANGE,
+                    MqConstants.SECKILL_ORDER_ROUTING_KEY,
+                    message,
+                    correlationData
             );
-            log.info("秒杀订单消息发送成功: orderId={}, userId={}, voucherId={}",
-                    message.getOrderId(), message.getUserId(), message.getVoucherId());
+            log.info("秒杀订单消息已提交({}): orderId={}, userId={}, voucherId={}",
+                    mode, orderId, message.getUserId(), message.getVoucherId());
             return true;
         } catch (Exception e) {
-            log.error("秒杀订单消息发送失败: orderId={}, error={}", message.getOrderId(), e.getMessage(), e);
+            log.error("秒杀订单消息提交失败 orderId={}, error={}", orderId, e.getMessage(), e);
+            // 连提交都没成功，broker 不可能收到，直接补偿（幂等）
+            compensator.compensate(orderId, message.getUserId(), message.getVoucherId(), "提交阶段异常: " + e.getMessage());
             return false;
         }
     }
 
     /**
-     * 异步发送秒杀订单消息
-     * 
-     * 适用于高并发场景，不阻塞主线程，通过回调函数处理发送结果。
-     * 即使发送失败，也不会影响用户秒杀资格（Redis已预扣库存）。
-     * 
-     * @param message 秒杀订单消息
-     * @return true-提交成功（不代表发送成功），false-提交失败
+     * 注册单条消息的 confirm 回调。
+     *
+     * 用 getFuture().whenComplete 而不是只靠全局 ConfirmCallback 的原因：
+     *   全局回调只能拿到 correlationId（一个字符串），拿不到 userId/voucherId，
+     *   而补偿 Redis 预扣需要这两个值。这里闭包直接捕获了 message。
+     *
+     * 【两个独立维度，缺一不可】
+     *   confirm.ack=false  -> broker 根本没收到（队列不存在、磁盘告警、内部错误）
+     *   correlationData.getReturned() != null -> broker 收到了，但路由不到任何队列
+     *     （routingKey 写错）。这种情况下 confirm 仍然是 ack=true，只看 ack 会漏判。
      */
-    public boolean sendSeckillOrderMessageAsync(SeckillOrderMessage message) {
-        try {
-            rocketMQTemplate.asyncSend(
-                    TOPIC_SECKILL_ORDER,
-                    MessageBuilder.withPayload(message).build(),
-                    new org.apache.rocketmq.client.producer.SendCallback() {
-                        @Override
-                        public void onSuccess(org.apache.rocketmq.client.producer.SendResult sendResult) {
-                            log.info("秒杀订单消息异步发送成功: orderId={}, msgId={}",
-                                    message.getOrderId(), sendResult.getMsgId());
-                        }
+    private void attachConfirmCallback(CorrelationData correlationData, SeckillOrderMessage message) {
+        Long orderId = message.getOrderId();
 
-                        @Override
-                        public void onException(Throwable e) {
-                            log.error("秒杀订单消息异步发送失败: orderId={}, error={}",
-                                    message.getOrderId(), e.getMessage(), e);
-                        }
-                    },
-                    3000
-            );
-            return true;
-        } catch (Exception e) {
-            log.error("秒杀订单消息异步发送异常: orderId={}, error={}", message.getOrderId(), e.getMessage(), e);
-            return false;
-        }
+        correlationData.getFuture().whenComplete((confirm, ex) -> {
+            boolean ack = ex == null && confirm != null && confirm.isAck();
+            boolean returned = correlationData.getReturned() != null;
+
+            if (ack && !returned) {
+                log.debug("broker 已确认秒杀订单消息 orderId={}", orderId);
+                return;
+            }
+
+            String cause;
+            if (ex != null) {
+                cause = "confirm 异常: " + ex.getMessage();
+            } else if (returned) {
+                cause = "消息路由失败(无匹配队列): " + correlationData.getReturned().getReplyText();
+            } else {
+                cause = "broker 未确认: " + (confirm != null ? confirm.getReason() : "未知原因");
+            }
+
+            log.error("秒杀订单消息【投递失败】，触发 Redis 预扣补偿 orderId={}, cause={}", orderId, cause);
+            compensator.compensate(orderId, message.getUserId(), message.getVoucherId(), cause);
+        });
     }
 
+    /**
+     * 发送消息到死信队列。
+     *
+     * 当消息处理失败且超过最大重试次数时调用。
+     */
     public void sendToDeadLetterQueue(SeckillOrderMessage message, String reason) {
         try {
-            message.setRetryCount(message.getRetryCount() + 1);
-            rocketMQTemplate.syncSend(
-                    TOPIC_SECKILL_ORDER_DLQ,
-                    MessageBuilder.withPayload(message)
-                            .setHeader("reason", reason)
-                            .setHeader("retryCount", message.getRetryCount())
-                            .build()
+            message.setRetryCount(message.getRetryCount() == null ? 1 : message.getRetryCount() + 1);
+            rabbitTemplate.convertAndSend(
+                    MqConstants.SECKILL_ORDER_DLX_EXCHANGE,
+                    MqConstants.SECKILL_ORDER_DLX_ROUTING_KEY,
+                    message
             );
             log.warn("订单消息发送到死信队列: orderId={}, reason={}, retryCount={}",
                     message.getOrderId(), reason, message.getRetryCount());
         } catch (Exception e) {
             log.error("发送到死信队列失败: orderId={}, error={}", message.getOrderId(), e.getMessage(), e);
         }
-    }
-
-    public void sendStockSyncMessage(Long voucherId, Integer stock) {
-        try {
-            rocketMQTemplate.asyncSend(
-                    TOPIC_STOCK_SYNC,
-                    MessageBuilder.withPayload(new StockSyncMessage(voucherId, stock)).build(),
-                    new org.apache.rocketmq.client.producer.SendCallback() {
-                        @Override
-                        public void onSuccess(org.apache.rocketmq.client.producer.SendResult sendResult) {
-                            log.info("库存同步消息发送成功: voucherId={}, stock={}", voucherId, stock);
-                        }
-
-                        @Override
-                        public void onException(Throwable e) {
-                            log.error("库存同步消息发送失败: voucherId={}, error={}", voucherId, e.getMessage());
-                        }
-                    },
-                    3000
-            );
-        } catch (Exception e) {
-            log.error("库存同步消息发送异常: voucherId={}, error={}", voucherId, e.getMessage(), e);
-        }
-    }
-
-    @Data
-    @AllArgsConstructor
-    @NoArgsConstructor
-    public static class StockSyncMessage {
-        private Long voucherId;
-        private Integer stock;
     }
 }

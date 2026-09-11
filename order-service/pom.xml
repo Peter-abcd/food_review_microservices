@@ -87,13 +87,13 @@
             <version>0.0.1-SNAPSHOT</version>
         </dependency>
 
-        <!-- Sa-Token Spring Boot 3（Servlet 业务服务） -->
+        <!-- Sa-Token Spring Boot 3（Servlet 业务服务）-->
         <dependency>
             <groupId>cn.dev33</groupId>
             <artifactId>sa-token-spring-boot3-starter</artifactId>
             <version>${sa-token.version}</version>
         </dependency>
-        <!-- Sa-Token Redis 持久化 -->
+        <!-- Sa-Token Redis 持久化-->
         <dependency>
             <groupId>cn.dev33</groupId>
             <artifactId>sa-token-redis-jackson</artifactId>
@@ -115,13 +115,6 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
-        </dependency>
-
-        <!-- RocketMQ -->
-        <dependency>
-            <groupId>org.apache.rocketmq</groupId>
-            <artifactId>rocketmq-spring-boot-starter</artifactId>
-            <version>2.3.0</version> <!-- 必须 2.3.0+ 才完美支持 Spring Boot 3 -->
         </dependency>
 
 

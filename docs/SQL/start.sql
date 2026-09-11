@@ -106,6 +106,7 @@ CREATE TABLE `tb_voucher_order` (
                                     `refund_time` timestamp DEFAULT NULL COMMENT '退款时间',
                                     `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                                     PRIMARY KEY (`id`),
+                                    UNIQUE KEY `uk_user_voucher` (`user_id`, `voucher_id`),
                                     KEY `idx_user_id` (`user_id`),
                                     KEY `idx_voucher_id` (`voucher_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='优惠券订单表';

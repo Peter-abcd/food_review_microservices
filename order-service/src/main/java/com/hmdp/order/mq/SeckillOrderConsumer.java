@@ -4,41 +4,54 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.SeckillOrderMessage;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.order.config.RabbitMqConfig;
+import com.hmdp.order.config.SeckillProperties;
 import com.hmdp.order.feign.VoucherFeignClient;
 import com.hmdp.order.mapper.VoucherOrderMapper;
 import com.hmdp.order.metrics.SeckillMetrics;
+import com.hmdp.utils.MqConstants;
 import com.hmdp.utils.RedisConstants;
+import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
-import org.apache.rocketmq.spring.core.RocketMQListener;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.support.AmqpHeaders;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.Resource;
+import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
 /**
  * 秒杀订单消息消费者
- * 
- * 负责消费秒杀资格校验通过后产生的订单消息，完成最终的下单操作。
- * 核心职责：
- * 1. 保证消息消费的幂等性（通过订单ID去重）
- * 2. 执行最终的一致性检查（一人一单、库存扣减）
- * 3. 处理异常情况并回滚Redis预扣数据
- * 4. 记录消费指标用于监控
- * 
- * 采用分布式锁保证同一订单的串行处理，避免重复消费导致的数据不一致问题。
+ *
+ * 处理流程：
+ *   1. 取分布式锁，保证同一订单串行处理
+ *   2. 幂等检查（订单已存在则直接跳过）
+ *   3. 一人一单终态校验（失败则回滚 Redis 并确认，不重试）
+ *   4. Feign 调 voucher-service 扣减数据库库存
+ *   5. 订单落库
+ *   6. 清理 Lua 写入的 Redis 订单明细
+ *
+ * 失败处理（本次改造重点）：
+ *   - 不再使用 basicNack(requeue=true)。那是"立刻、无限"重投，没有退避也没有上限，
+ *     业务异常时消息会在队列里高速空转，把 CPU 和日志打满。
+ *   - 改为：重试计数放 Redis，nack(requeue=false) 让消息经主队列 DLX 进入重试队列，
+ *     等 TTL 到期后自动回到主队列 —— 这样才有"间隔"，且次数可计数、有上限。
+ *   - 超过上限后投递死信队列并 ack，同时按情况回滚 Redis 预扣，避免"库存扣了、订单没建"。
+ *
+ * 关键陷阱（踩过的坑）：
+ *   手动 ACK 模式下，如果异常发生在 listener 方法被调用【之前】（例如消息转换失败），
+ *   这里的 catch 根本不会执行，消息会永久卡在 unacked 状态 ——
+ *   既不被重投、也不进死信、也不被 ack。所以消息转换器的配置必须正确
+ *   （见 RabbitMqConfig#jsonMessageConverter）。
  */
 @Component
-@RocketMQMessageListener(
-        topic = SeckillOrderProducer.TOPIC_SECKILL_ORDER,
-        consumerGroup = "seckill-order-consumer-group",
-        maxReconsumeTimes = 3
-)
 @Slf4j
-public class SeckillOrderConsumer implements RocketMQListener<SeckillOrderMessage> {
+public class SeckillOrderConsumer {
 
     @Resource
     private VoucherOrderMapper voucherOrderMapper;
@@ -55,145 +68,186 @@ public class SeckillOrderConsumer implements RocketMQListener<SeckillOrderMessag
     @Resource
     private SeckillMetrics seckillMetrics;
 
-    private static final int MAX_RETRY_COUNT = 3;
+    @Resource
+    private SeckillOrderProducer seckillOrderProducer;
+
+    @Resource
+    private SeckillRedisCompensator compensator;
 
     /**
-     * 处理秒杀订单消息
-     * 
-     * 消费流程：
-     * 1. 获取分布式锁，保证同一订单的串行处理
-     * 2. 检查订单是否已存在（幂等性保障）
-     * 3. 二次校验一人一单规则（防止极端情况下的并发问题）
-     * 4. 调用库存服务扣减数据库库存
-     * 5. 创建订单记录到数据库
-     * 6. 清理Redis中的临时订单数据
-     * 
-     * 异常处理：
-     * - 任何步骤失败都会回滚Redis预扣数据
-     * - 重试次数超过上限后需要人工干预
-     * 
-     * @param message 秒杀订单消息
+     * 可动态调整的参数（Nacos 下发，改完不需要重启服务）。
+     *
+     * 为什么不给消费者本身加 @RefreshScope：它身上挂着 @RabbitListener，
+     * 监听器 bean 被刷新会重建容器，可能丢掉正在处理的消息。
+     * 把「会变的配置」隔离到 SeckillProperties，刷新时只重建那个小 bean，
+     * 这里用到的时候现取即可。
      */
-    @Override
-    public void onMessage(SeckillOrderMessage message) {
+    @Resource
+    private SeckillProperties seckillProperties;
+
+    @RabbitListener(queues = MqConstants.SECKILL_ORDER_QUEUE)
+    public void onMessage(SeckillOrderMessage message, Channel channel,
+                          @Header(AmqpHeaders.DELIVERY_TAG) long deliveryTag) throws IOException {
+
         Long orderId = message.getOrderId();
         Long userId = message.getUserId();
         Long voucherId = message.getVoucherId();
 
-        log.info("开始处理秒杀订单消息: orderId={}, userId={}, voucherId={}, retryCount={}",
-                orderId, userId, voucherId, message.getRetryCount());
+        log.info("开始处理秒杀订单消息: orderId={}, userId={}, voucherId={}", orderId, userId, voucherId);
 
-        String lockKey = "lock:order:" + orderId;
-        RLock lock = redissonClient.getLock(lockKey);
+        RLock lock = redissonClient.getLock("lock:order:" + orderId);
+        boolean locked = false;
+
+        // 数据库库存是否已经真实扣减成功。决定最终失败时能不能安全回滚 Redis 预扣。
+        boolean dbStockDeducted = false;
 
         try {
-            boolean locked = lock.tryLock(10, 30, TimeUnit.SECONDS);
+            locked = lock.tryLock(10, 30, TimeUnit.SECONDS);
             if (!locked) {
-                log.warn("获取订单锁失败，可能正在处理中: orderId={}", orderId);
+                // 拿不到锁 = 同订单正在被处理，属于可重试的瞬时状态，交给重试队列
+                throw new IllegalStateException("获取订单锁失败，可能正在处理中");
+            }
+
+            // ---------- 1. 幂等：订单已存在 ----------
+            VoucherOrder existingOrder = voucherOrderMapper.selectById(orderId);
+            if (existingOrder != null) {
+                log.info("订单已存在，幂等跳过: orderId={}", orderId);
+                seckillMetrics.incrementMqConsumeSuccess();
+                channel.basicAck(deliveryTag, false);
                 return;
             }
 
-            try {
-                VoucherOrder existingOrder = voucherOrderMapper.selectById(orderId);
-                if (existingOrder != null) {
-                    log.info("订单已存在，跳过处理: orderId={}", orderId);
-                    seckillMetrics.incrementMqConsumeSuccess();
-                    return;
-                }
-
-                Long count = voucherOrderMapper.selectCount(
-                        new LambdaQueryWrapper<VoucherOrder>()
-                                .eq(VoucherOrder::getUserId, userId)
-                                .eq(VoucherOrder::getVoucherId, voucherId)
-                );
-                if (count > 0) {
-                    log.warn("用户已购买过该优惠券，一人一单校验失败: userId={}, voucherId={}", userId, voucherId);
-                    rollbackRedisStockOnly(voucherId, userId);
-                    seckillMetrics.incrementMqConsumeFail();
-                    return;
-                }
-
-                Result deductResult = voucherFeignClient.deductStock(voucherId);
-                if (!deductResult.getSuccess()) {
-                    log.error("扣减库存失败: voucherId={}, result={}", voucherId, deductResult.getErrorMsg());
-                    rollbackRedisData(voucherId, userId);
-                    seckillMetrics.incrementMqConsumeFail();
-                    return;
-                }
-
-                VoucherOrder voucherOrder = new VoucherOrder();
-                voucherOrder.setId(orderId);
-                voucherOrder.setUserId(userId);
-                voucherOrder.setVoucherId(voucherId);
-                voucherOrder.setStatus(1);
-
-                int insertResult = voucherOrderMapper.insert(voucherOrder);
-                if (insertResult > 0) {
-                    seckillMetrics.incrementMqConsumeSuccess();
-                    log.info("订单创建成功: orderId={}, userId={}, voucherId={}", orderId, userId, voucherId);
-                    stringRedisTemplate.opsForHash().delete(
-                            RedisConstants.SECKILL_STOCK_KEY + "order:detail:" + voucherId,
-                            orderId.toString()
-                    );
-                } else {
-                    log.error("订单插入失败: orderId={}", orderId);
-                    seckillMetrics.incrementMqConsumeFail();
-                    throw new RuntimeException("订单插入失败");
-                }
-
-            } finally {
-                if (lock.isHeldByCurrentThread()) {
-                    lock.unlock();
-                }
+            // ---------- 2. 一人一单终态校验 ----------
+            Long count = voucherOrderMapper.selectCount(
+                    new LambdaQueryWrapper<VoucherOrder>()
+                            .eq(VoucherOrder::getUserId, userId)
+                            .eq(VoucherOrder::getVoucherId, voucherId)
+            );
+            if (count != null && count > 0) {
+                log.warn("一人一单校验失败，回滚 Redis 库存: userId={}, voucherId={}", userId, voucherId);
+                // 保留用户购买标记（用户确实已有订单），只把多扣的库存还回去
+                rollbackRedisStockOnly(voucherId);
+                seckillMetrics.incrementMqConsumeFail();
+                channel.basicAck(deliveryTag, false);
+                return;
             }
+
+            // ---------- 3. 扣减数据库库存（跨服务） ----------
+            Result deductResult = voucherFeignClient.deductStock(voucherId);
+            if (!deductResult.getSuccess()) {
+                // 可能是库存真的不足，也可能是 voucher-service 抖动/降级，后者重试有意义
+                throw new IllegalStateException("扣减库存失败: " + deductResult.getErrorMsg());
+            }
+            dbStockDeducted = true;
+
+            // ---------- 4. 订单落库 ----------
+            VoucherOrder voucherOrder = new VoucherOrder();
+            voucherOrder.setId(orderId);
+            voucherOrder.setUserId(userId);
+            voucherOrder.setVoucherId(voucherId);
+            voucherOrder.setStatus(1);
+
+            if (voucherOrderMapper.insert(voucherOrder) <= 0) {
+                // 这里【不要】再自己 basicNack：外层 catch 会对同一个 deliveryTag 再操作一次，
+                // 导致 RabbitMQ 报 PRECONDITION_FAILED: unknown delivery tag 并关闭整个 channel。
+                // 抛出去，让唯一的 catch 决定 ack / nack。
+                throw new IllegalStateException("订单插入失败");
+            }
+
+            // ---------- 5. 清理 Redis 订单明细 ----------
+            // key 必须与 seckill.lua 写入的一致：seckill:order:detail:{voucherId}
+            stringRedisTemplate.opsForHash().delete(
+                    RedisConstants.SECKILL_ORDER_DETAIL_KEY + voucherId,
+                    orderId.toString()
+            );
+
+            log.info("订单创建成功: orderId={}, userId={}, voucherId={}", orderId, userId, voucherId);
+            seckillMetrics.incrementMqConsumeSuccess();
+            channel.basicAck(deliveryTag, false);
 
         } catch (InterruptedException e) {
-            log.error("获取锁被中断: orderId={}", orderId, e);
+            // 线程被中断不是业务失败，直接重投
             Thread.currentThread().interrupt();
+            log.error("获取锁被中断: orderId={}", orderId, e);
             seckillMetrics.incrementMqConsumeFail();
-            throw new RuntimeException("获取锁被中断", e);
-        } catch (Exception e) {
-            log.error("处理秒杀订单消息异常: orderId={}, error={}", orderId, e.getMessage(), e);
-            seckillMetrics.incrementMqConsumeFail();
+            channel.basicNack(deliveryTag, false, true);
 
-            if (message.getRetryCount() >= MAX_RETRY_COUNT) {
-                log.error("订单处理重试次数已达上限，需要人工干预: orderId={}, retryCount={}",
-                        orderId, message.getRetryCount());
+        } catch (Exception e) {
+            seckillMetrics.incrementMqConsumeFail();
+            handleFailure(message, channel, deliveryTag, dbStockDeducted, e);
+
+        } finally {
+            if (locked && lock.isHeldByCurrentThread()) {
+                lock.unlock();
             }
-            throw new RuntimeException("订单处理失败", e);
         }
     }
 
     /**
-     * 回滚Redis预扣数据
-     * 
-     * 在消息消费失败时调用，用于恢复Redis中的库存和用户购买记录。
-     * 保证Redis预扣数据与数据库最终状态的一致性。
-     * 
-     * @param voucherId 优惠券ID
-     * @param userId 用户ID
+     * 失败处理：有限次延迟重试，超过上限转死信。
      */
-    private void rollbackRedisData(Long voucherId, Long userId) {
+    private void handleFailure(SeckillOrderMessage message, Channel channel, long deliveryTag,
+                               boolean dbStockDeducted, Exception cause) throws IOException {
+
+        Long orderId = message.getOrderId();
+        Long userId = message.getUserId();
+        Long voucherId = message.getVoucherId();
+
+        String retryKey = RedisConstants.SECKILL_RETRY_COUNT_KEY + orderId;
+        Long attempts = stringRedisTemplate.opsForValue().increment(retryKey);
+        if (attempts != null && attempts == 1L) {
+            stringRedisTemplate.expire(retryKey, seckillProperties.getRetryCountTtlMinutes(), TimeUnit.MINUTES);
+        }
+
+        log.error("秒杀订单处理失败: orderId={}, 第 {} 次尝试, error={}",
+                orderId, attempts, cause.getMessage(), cause);
+
+        // 每次现取，Nacos 改了值立刻生效（@RefreshScope 会重建 SeckillProperties）
+        int maxAttempts = seckillProperties.getRetryMaxAttempts();
+
+        // ---------- 还能重试 ----------
+        if (attempts != null && attempts < maxAttempts) {
+            log.warn("第 {}/{} 次尝试失败，{}ms 后经重试队列重新投递 orderId={}",
+                    attempts, maxAttempts, RabbitMqConfig.SECKILL_RETRY_TTL_MS, orderId);
+            // requeue=false：交给主队列的 DLX -> 重试队列 -> TTL 到期 -> 回主队列
+            // requeue=true 会绕过 TTL/DLX，等于没有延迟、没有上限
+            channel.basicNack(deliveryTag, false, false);
+            return;
+        }
+
+        // ---------- 重试耗尽，转死信 ----------
+        log.error("已达最大尝试次数 {} 次仍失败，转入死信队列等待人工/对账处理 orderId={}, userId={}, voucherId={}",
+                maxAttempts, orderId, userId, voucherId);
+
+        seckillOrderProducer.sendToDeadLetterQueue(message, cause.getMessage());
+
+        if (!dbStockDeducted) {
+            // 数据库库存没被扣过，回滚 Redis 预扣是安全的，用户还能重新下单
+            log.warn("数据库库存未扣减，回滚 Redis 预扣 orderId={}", orderId);
+            // 幂等补偿：confirm/return 回调可能已经补偿过，重复补偿会导致库存多加
+            compensator.compensate(orderId, userId, voucherId, "消费重试耗尽且数据库库存未扣减");
+        } else {
+            // 数据库库存已扣、订单没落库 —— 不能简单回滚 Redis，否则会超卖。
+            // 交给死信队列 + SeckillConsistencyService 对账。这行日志必须能被监控抓到。
+            log.error("【数据不一致】数据库库存已扣减但订单未落库，需对账 orderId={}, userId={}, voucherId={}",
+                    orderId, userId, voucherId);
+        }
+
+        stringRedisTemplate.delete(retryKey);
+        channel.basicAck(deliveryTag, false);
+    }
+
+    /**
+     * 仅回滚 Redis 库存，保留用户购买标记。
+     *
+     * 用于"用户确实已经下过单"的场景 —— 标记要留着（防止再次下单），只把多扣的库存还回去。
+     */
+    private void rollbackRedisStockOnly(Long voucherId) {
         try {
             stringRedisTemplate.opsForValue().increment(RedisConstants.SECKILL_STOCK_KEY + voucherId);
-            stringRedisTemplate.opsForSet().remove("seckill:order:" + voucherId, userId.toString());
-            log.info("Redis数据回滚成功: voucherId={}, userId={}", voucherId, userId);
+            log.info("仅回滚 Redis 库存，保留用户购买标记: voucherId={}", voucherId);
         } catch (Exception e) {
-            log.error("Redis数据回滚失败: voucherId={}, userId={}, error={}", voucherId, userId, e.getMessage(), e);
+            log.error("Redis 库存回滚失败: voucherId={}, error={}", voucherId, e.getMessage(), e);
         }
     }
-
-    private void rollbackRedisStockOnly(Long voucherId, Long userId) {
-        try {
-            stringRedisTemplate.opsForValue()
-                    .increment(RedisConstants.SECKILL_STOCK_KEY + voucherId);
-
-            log.info("重复下单仅回滚Redis库存，保留用户购买标记: voucherId={}, userId={}",
-                    voucherId, userId);
-        } catch (Exception e) {
-            log.error("Redis库存回滚失败: voucherId={}, userId={}, error={}",
-                    voucherId, userId, e.getMessage(), e);
-        }
-    }
-
 }

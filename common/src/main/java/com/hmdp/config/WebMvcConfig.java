@@ -29,7 +29,12 @@ public class WebMvcConfig implements WebMvcConfigurer {
                         "/shop/**",
                         "/voucher/**",
                         "/shop-type/**",
-                        "/actuator/**"
+                        "/actuator/**",
+                        // 【必须排除 /error】否则"没有匹配的 handler"会被转发到 /error，
+                        // 而 /error 不在排除名单里就会被本拦截器拦下，最终把 404 变成 401。
+                        // 后果：任何 Feign 路径写错/接口不存在都会被误读成鉴权失败，
+                        // 排查时方向直接跑偏（本项目真的踩过）。
+                        "/error"
                 ).order(1);
     }
 }

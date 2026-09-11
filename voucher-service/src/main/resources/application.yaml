@@ -7,7 +7,7 @@ spring:
   # 数据库配置
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver # 数据库驱动类名，MySQL 8.x 使用 com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://127.0.0.1:3306/hm_dianping?useSSL=false&serverTimezone=UTC # 数据库连接URL，格式：jdbc:mysql://ip:port/数据库名?参数
+    url: jdbc:mysql://127.0.0.1:3306/hm_voucher?useSSL=false&serverTimezone=UTC # 数据库连接URL，格式：jdbc:mysql://ip:port/数据库名?参数
     username: root # 数据库用户名
     password: 1234 # 数据库密码
   # Redis 配置

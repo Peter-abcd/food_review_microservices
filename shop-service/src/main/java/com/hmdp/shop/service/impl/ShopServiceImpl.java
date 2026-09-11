@@ -98,15 +98,20 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     // NOTE 线程池用于异步缓存预热
     private ExecutorService cacheWarmupExecutor;
 
-//    /**
-//     * 初始化方法 - 创建线程池
-//     */
-//    @PostConstruct
-//    public void init() {
-//        // 创建固定大小的线程池用于缓存预热
-//        cacheWarmupExecutor = Executors.newFixedThreadPool(3);
-//        logger.info("缓存预热线程池初始化完成");
-//    }
+    /**
+     * 初始化方法 - 创建线程池
+     *
+     * 必须保留：cacheWarmupExecutor 是字段级依赖，warmUpPopularShops / warmUpShopsByType /
+     * warmUpGeoData 三个方法都在 submit 到它。这里不初始化，字段恒为 null，
+     * 启动预热会直接 NPE 并被 try/catch 吞掉，表现为日志里一句
+     * "手动缓存预热失败"，而缓存其实一次都没预热。
+     */
+    @PostConstruct
+    public void init() {
+        // 创建固定大小的线程池用于缓存预热
+        cacheWarmupExecutor = Executors.newFixedThreadPool(3);
+        logger.info("缓存预热线程池初始化完成");
+    }
 //
 //    /**
 //     * 缓存预热 - 应用启动时执行

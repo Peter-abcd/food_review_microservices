@@ -1,0 +1,129 @@
+============================================================
+  RocketMQ -> RabbitMQ 迁移变更总结
+  生成时间: 2026-05-27 22:22:46
+============================================================
+
+一、变更总览
+------------------------------------------------------------
+项目已从 RocketMQ 统一迁移到 RabbitMQ，
+仅 order-service 的秒杀订单流程涉及 MQ 改造，
+shop-service 原本已使用 RabbitMQ（商户缓存广播），无需修改。
+
+二、修改的文件（10 个）
+------------------------------------------------------------
+
+1. pom.xml（root）
+   - 移除 rocketmq.version 属性
+   - 移除全部 7 个 RocketMQ dependencyManagement 条目
+     (rocketmq-spring-boot-starter, rocketmq-client,
+      rocketmq-common, rocketmq-acl, rocketmq-remoting,
+      rocketmq-logging, rocketmq-srvutil)
+
+2. order-service/pom.xml
+   - 移除 rocketmq-spring-boot-starter 依赖
+   - spring-boot-starter-amqp 已保留（原已存在）
+
+3. order-service/src/main/resources/application.yaml
+   - 移除 rocketmq: 配置块（name-server, producer）
+   - rabbitmq: 配置已保留（host/port/username/password/
+     publisher-confirm/manual-ack/prefetch）
+
+4. order-service/src/main/resources/bootstrap.yaml
+   - 移除 rocketmq: 配置块
+
+5. common/src/main/java/com/hmdp/utils/MqConstants.java
+   - 新增秒杀订单相关常量：
+     SECKILL_ORDER_EXCHANGE = "seckill.order.exchange"
+     SECKILL_ORDER_QUEUE = "seckill.order.queue"
+     SECKILL_ORDER_ROUTING_KEY = "seckill.order"
+     SECKILL_ORDER_DLX_EXCHANGE = "seckill.order.dlx.exchange"
+     SECKILL_ORDER_DLX_QUEUE = "seckill.order.dlx.queue"
+     SECKILL_ORDER_DLX_ROUTING_KEY = "seckill.order.dlx"
+
+6. order-service/.../mq/SeckillOrderProducer.java
+   - RocketMQTemplate -> RabbitTemplate
+   - syncSend/asyncSend -> convertAndSend + CorrelationData
+   - 保留 sendSeckillOrderMessage / sendSeckillOrderMessageAsync /
+     sendToDeadLetterQueue / sendStockSyncMessage 方法签名
+
+7. order-service/.../mq/SeckillOrderConsumer.java
+   - @RocketMQMessageListener -> @RabbitListener(queues)
+   - implements RocketMQListener -> 普通 @Component + 方法参数
+   - 新增 Channel + @Header(DELIVERY_TAG) 参数实现手动 ACK
+   - 消费成功: channel.basicAck
+   - 可重试失败: channel.basicNack(requeue=true)
+   - 不可恢复失败: 发送到死信队列 + basicAck
+
+8. order-service/.../mq/SeckillOrderDLQConsumer.java
+   - @RocketMQMessageListener -> @RabbitListener(queues)
+   - 同样使用手动 ACK
+
+9. order-service/.../handler/SeckillExceptionHandler.java
+   - 移除 MQClientException import 和对应异常处理器
+
+10. config/docker-compose.yml
+    - 移除 RocketMQ NameServer (apache/rocketmq:5.3.1)
+    - 移除 RocketMQ Broker (apache/rocketmq:5.3.1)
+    - 新增 RabbitMQ (rabbitmq:3-management)
+      端口: 5672 (AMQP) / 15672 (管理界面)
+
+三、新增的文件（1 个）
+------------------------------------------------------------
+
+order-service/.../config/RabbitMqConfig.java
+   - 声明秒杀订单 DirectExchange (seckill.order.exchange)
+   - 声明持久化队列 (seckill.order.queue)，配置 DLX
+   - 声明死信 DirectExchange (seckill.order.dlx.exchange)
+   - 声明死信队列 (seckill.order.dlx.queue)
+   - 绑定关系: 队列 -> 交换机 -> 路由键
+
+四、Module-demo 清理
+------------------------------------------------------------
+
+  Module-demo/pom.xml           RocketMQ 依赖 -> spring-boot-starter-amqp
+  Module-demo/application.yml   rocketmq: -> rabbitmq: 配置
+  Module-demo/TestProducer      RocketMQTemplate -> RabbitTemplate
+  Module-demo/TestConsumer      @RocketMQMessageListener -> @RabbitListener
+  Module-demo/ProducerExample.java     已删除（全注释代码）
+  Module-demo/PushConsumerExample.java 已删除（旧版 API 示例）
+
+五、RabbitMQ 消息拓扑
+------------------------------------------------------------
+
+  seckill.order.exchange (Direct)
+    |
+    |-- routing: "seckill.order"
+    |     \-- seckill.order.queue (持久化, DLX配置)
+    |           |
+    |           \-- 失败/reject 自动路由到:
+    |
+    \-- seckill.order.dlx.exchange (Direct)
+          |
+          \-- routing: "seckill.order.dlx"
+                \-- seckill.order.dlx.queue (死信队列)
+
+六、关键设计说明
+------------------------------------------------------------
+
+1. 消费端手动 ACK
+   - application.yaml 中配置 acknowledge-mode: manual
+   - prefetch: 1（每次只拉取 1 条，防内存溢出，公平分发）
+   - 消费成功调用 channel.basicAck
+   - 可重试异常调用 channel.basicNack(requeue=true)
+   - 超过最大重试次数发送到死信队列
+
+2. 生产者可靠性
+   - publisher-confirm-type: correlated（生产者确认）
+   - publisher-returns: true（路由失败退回）
+   - 使用 CorrelationData 关联消息 ID
+
+3. 死信队列 (DLQ)
+   - 主队列配置 x-dead-letter-exchange 和 x-dead-letter-routing-key
+   - 消息被 nack 且不入队时自动路由到 DLQ
+   - DLQ 消费者记录失败订单到 Redis 待处理列表
+
+4. 与原有 RocketMQ 功能对比
+   - RocketMQ syncSend   -> RabbitTemplate.convertAndSend (同步)
+   - RocketMQ asyncSend  -> RabbitTemplate.convertAndSend (异步，配合 CorrelationData)
+   - RocketMQ @RocketMQMessageListener -> @RabbitListener + 手动ACK
+   - RocketMQ 自动重试    -> RabbitMQ DLX 机制 + basicNack(requeue)
