@@ -86,6 +86,21 @@ public class SeckillOrderProducer {
      *   correlationData.getReturned() != null -> broker 收到了，但路由不到任何队列
      *     （routingKey 写错）。这种情况下 confirm 仍然是 ack=true，只看 ack 会漏判。
      */
+
+    /**
+     * 两个维度：
+     *
+     * 1. confirm.ack == false
+     *    Broker 无法对本次 publish 承担责任。
+     *    可能是 broker 内部处理异常，或者框架由于连接/Channel异常
+     *    对尚未确认的消息生成 nack。
+     *
+     * 2. correlationData.getReturned() != null
+     *    Exchange 存在，并且 Broker 接收了 publish，
+     *    但 mandatory=true 时发现无法路由到任何 Queue。
+     *    这种情况仍然可能收到 ack=true。
+     */
+
     private void attachConfirmCallback(CorrelationData correlationData, SeckillOrderMessage message) {
         Long orderId = message.getOrderId();
 
